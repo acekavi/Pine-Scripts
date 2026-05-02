@@ -1,8 +1,8 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 // @version=6
-// @author=acekavi
+//  © acekavi
 // =============================================================================
-// S&D + HTF Liquidity INDICATOR  —  clean single-closest-level display
+// S&D + HTF Liquidity INDICATOR [acekavi]  —  clean single-closest-level display
 //
 // Changes in this version:
 //   • Only the CLOSEST BSL (above price) and CLOSEST SSL (below price) are
