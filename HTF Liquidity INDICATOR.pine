@@ -2,13 +2,13 @@
 // @version=6
 // © acekavi
 // =============================================================================
-// S&D + HTF Liquidity INDICATOR  —  with Stoch RSI confluence signals
+// S&D + HTF Liquidity INDICATOR  —  with Stoch RSI + EMA + VWAP confluence
 // =============================================================================
 indicator("S&D + HTF Liquidity", "S&D+HTF",
      overlay          = true,
      max_boxes_count  = 100,
      max_lines_count  = 200,
-     max_labels_count = 200)   // bumped to 200 for confluence labels
+     max_labels_count = 200)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // COLORS
@@ -17,6 +17,10 @@ color BULL_COLOR  = #089981
 color BEAR_COLOR  = #f23645
 color LIQ_D_COLOR = #5b9cf6
 color LIQ_4_COLOR = #9c5bf6
+color EMA_FAST_COLOR = #ffeb3b
+color EMA_MID_COLOR  = #ff9800
+color EMA_SLOW_COLOR = #e91e63
+color VWAP_COLOR     = #00bcd4
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INPUTS
@@ -39,6 +43,21 @@ int   srsiSmoothD    = input.int(3,   "D Smoothing",              minval = 1,   
 float srsiOB         = input.float(80, "Overbought Level",        minval = 50,  maxval = 100, group = "Stoch RSI Confluence")
 float srsiOS         = input.float(20, "Oversold Level",          minval = 0,   maxval = 50,  group = "Stoch RSI Confluence")
 bool  showConfluence = input.bool(true, "Show Confluence Signals",                            group = "Stoch RSI Confluence")
+
+// EMA inputs
+bool  showEMAs      = input.bool(true, "Show EMAs",                                           group = "EMA & VWAP Filters")
+int   emaFastLen    = input.int(9,    "Fast EMA Length",          minval = 1,                 group = "EMA & VWAP Filters")
+int   emaMidLen     = input.int(21,   "Mid EMA Length",           minval = 1,                 group = "EMA & VWAP Filters")
+int   emaSlowLen    = input.int(50,   "Slow EMA (Bias) Length",   minval = 1,                 group = "EMA & VWAP Filters")
+bool  useEMABias    = input.bool(true, "Filter: Require EMA Trend Alignment",                 group = "EMA & VWAP Filters",
+     tooltip = "Long requires Fast EMA > Mid EMA. Short requires Fast EMA < Mid EMA.")
+bool  useEMASlowBias = input.bool(true, "Filter: Require Slow EMA Bias",                      group = "EMA & VWAP Filters",
+     tooltip = "Long requires close > Slow EMA. Short requires close < Slow EMA.")
+
+// VWAP inputs
+bool  showVWAP      = input.bool(true, "Show VWAP",                                           group = "EMA & VWAP Filters")
+bool  useVWAPBias   = input.bool(true, "Filter: Require VWAP Side Alignment",                 group = "EMA & VWAP Filters",
+     tooltip = "Long requires close > VWAP. Short requires close < VWAP. Disable for strict counter-trend reversal trades.")
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TYPES
@@ -85,16 +104,43 @@ var int shown4hBSL    = na
 var int shown4hSSL    = na
 
 // ─────────────────────────────────────────────────────────────────────────────
+// EMA CALCULATIONS
+// ─────────────────────────────────────────────────────────────────────────────
+float emaFast = ta.ema(close, emaFastLen)
+float emaMid  = ta.ema(close, emaMidLen)
+float emaSlow = ta.ema(close, emaSlowLen)
+
+plot(showEMAs ? emaFast : na, "Fast EMA", color = color.new(EMA_FAST_COLOR, 0), linewidth = 1)
+plot(showEMAs ? emaMid  : na, "Mid EMA",  color = color.new(EMA_MID_COLOR,  0), linewidth = 1)
+plot(showEMAs ? emaSlow : na, "Slow EMA", color = color.new(EMA_SLOW_COLOR, 0), linewidth = 2)
+
+bool emaBullStack = emaFast > emaMid
+bool emaBearStack = emaFast < emaMid
+bool emaBullBias  = close   > emaSlow
+bool emaBearBias  = close   < emaSlow
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VWAP CALCULATION
+// ─────────────────────────────────────────────────────────────────────────────
+float vwapVal = ta.vwap(hlc3)
+
+plot(showVWAP and timeframe.isintraday ? vwapVal : na, "VWAP",
+     color = color.new(VWAP_COLOR, 0), linewidth = 1, style = plot.style_line)
+
+bool aboveVWAP = close > vwapVal
+bool belowVWAP = close < vwapVal
+
+// ─────────────────────────────────────────────────────────────────────────────
 // STOCHASTIC RSI CALCULATION
-// Uses Pine's built-in ta.stoch applied to RSI values — same as TradingView's
-// native Stoch RSI indicator. Scale is 0–100.
 // ─────────────────────────────────────────────────────────────────────────────
 float rsiVal  = ta.rsi(close, srsiLengthRSI)
 float stochK  = ta.sma(ta.stoch(rsiVal, rsiVal, rsiVal, srsiLengthK), srsiSmoothK)
 float stochD  = ta.sma(stochK, srsiSmoothD)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PREVIOUS DAY HIGH / LOW  (solid lines)
+// PREVIOUS DAY HIGH / LOW
+// Lines: 5 bars left → 5 bars right of current bar
+// Labels: opaque background, overlap-aware Y offset
 // ─────────────────────────────────────────────────────────────────────────────
 float pdHigh = request.security(syminfo.tickerid, "1D", high[1],  lookahead = barmerge.lookahead_on)
 float pdLow  = request.security(syminfo.tickerid, "1D", low[1],   lookahead = barmerge.lookahead_on)
@@ -104,7 +150,37 @@ var line  pdLowLine   = na
 var label pdHighLabel = na
 var label pdLowLabel  = na
 
-if showPDHL and timeframe.isintraday and barstate.islast
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPER: draw a fixed-width level line (5 left, 5 right) + opaque label
+// Returns [line, label]
+// ─────────────────────────────────────────────────────────────────────────────
+draw_fixed_line(float lvl, string txt, color col) =>
+    int x1 = bar_index - 100
+    int x2 = bar_index + 100
+    line  l  = line.new(x1, lvl, x2, lvl,
+                 color = color.new(col, 20),
+                 style = line.style_dashed, width = 1)
+    label lb = label.new(x2, lvl, txt,
+                 color     = color.new(col, 20),
+                 textcolor = color.white,
+                 style     = label.style_label_left,
+                 size      = size.small)
+    [l, lb]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPER: delete a line + label pair
+// ─────────────────────────────────────────────────────────────────────────────
+del_ll(line l, label lb) =>
+    if not na(l)
+        l.delete()
+    if not na(lb)
+        lb.delete()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PDH / PDL drawing — redraw every bar so lines track current position
+// ─────────────────────────────────────────────────────────────────────────────
+if showPDHL and timeframe.isintraday
+    // Delete previous drawings each bar so we redraw at current bar_index
     if not na(pdHighLine)
         pdHighLine.delete()
     if not na(pdLowLine)
@@ -113,16 +189,14 @@ if showPDHL and timeframe.isintraday and barstate.islast
         pdHighLabel.delete()
     if not na(pdLowLabel)
         pdLowLabel.delete()
-    pdHighLine  := line.new(bar_index, pdHigh, bar_index + 100, pdHigh,
-         color = color.new(LIQ_D_COLOR, 20), style = line.style_solid, width = 1)
-    pdHighLabel := label.new(bar_index + 1, pdHigh, "PDH",
-         color = color.new(color.black, 100), textcolor = color.new(LIQ_D_COLOR, 0),
-         style = label.style_label_right, size = size.small)
-    pdLowLine   := line.new(bar_index, pdLow, bar_index + 100, pdLow,
-         color = color.new(LIQ_D_COLOR, 20), style = line.style_solid, width = 1)
-    pdLowLabel  := label.new(bar_index + 1, pdLow, "PDL",
-         color = color.new(color.black, 100), textcolor = color.new(LIQ_D_COLOR, 0),
-         style = label.style_label_right, size = size.small)
+
+    [hl, hlb] = draw_fixed_line(pdHigh, "PDH", LIQ_D_COLOR)
+    pdHighLine  := hl
+    pdHighLabel := hlb
+
+    [ll, llb] = draw_fixed_line(pdLow,  "PDL", LIQ_D_COLOR)
+    pdLowLine  := ll
+    pdLowLabel := llb
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SUPPLY & DEMAND ZONE CREATION  (ICT Order Block rule)
@@ -162,7 +236,7 @@ if isStrongDown and baseIsBullish
      lookahead = barmerge.lookahead_on)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// REGISTER HTF LEVELS (no lines drawn here — closest-select pass draws them)
+// REGISTER HTF LEVELS
 // ─────────────────────────────────────────────────────────────────────────────
 register_htf_liq(float pVal, int pTime, bool isBSL, string tfName, color tfColor, array<int> tracker) =>
     if not na(pVal) and not na(pTime)
@@ -180,7 +254,7 @@ if show4H and timeframe.in_seconds() < timeframe.in_seconds("240")
     register_htf_liq(pl4, time4, false, "4H", LIQ_4_COLOR, processed4HTimes)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ZONE MANAGEMENT  (close-based mitigation — ICT standard)
+// ZONE MANAGEMENT
 // ─────────────────────────────────────────────────────────────────────────────
 manageZones(array<Zone> zoneArray, bool isBull) =>
     if array.size(zoneArray) > 0
@@ -224,32 +298,46 @@ inSupplyZone() =>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLOSEST LEVEL SELECTION + VISIBLE LINE MANAGEMENT
+//
+// Lines:  fixed-width, bar_index-5 → bar_index+5, redrawn each bar
+// Labels: opaque colored background, overlap-aware positioning
+//
+// Overlap logic: if a BSL/SSL level is within (atr * 0.15) of a PDH/PDL,
+// the label is nudged one position (label_lower_left vs label_upper_left)
+// so both are readable without stacking on top of each other.
 // ─────────────────────────────────────────────────────────────────────────────
-del_ll(line l, label lb) =>
-    if not na(l)
-        l.delete()
-    if not na(lb)
-        lb.delete()
 
-draw_ll(float lvl, string txt, color col) =>
-    int fTime = timenow + 86400000 * 365
-    line  l  = line.new(timenow, lvl, fTime, lvl,
-                         xloc  = xloc.bar_time, color = color.new(col, 30),
-                         style = line.style_dashed, width = 1)
-    label lb = label.new(bar_index, lvl, txt,
-                         color = color.new(color.black, 100),
-                         textcolor = color.new(col, 0),
-                         style = label.style_label_lower_left, size = size.small)
+// draw_ll: fixed-width line + opaque label for BSL/SSL levels
+// labelBelow = true  → label sits below the line (label_upper_left)
+// labelBelow = false → label sits above the line (label_lower_left)  [default]
+draw_ll(float lvl, string txt, color col, bool labelBelow = false) =>
+    int x1 = bar_index - 150
+    int x2 = bar_index + 150
+    line  l  = line.new(x1, lvl, x2, lvl,
+                 color = color.new(col, 30),
+                 style = line.style_dashed, width = 1)
+    label lb = label.new(x2, lvl, txt,
+                 color     = color.new(col, 20),
+                 textcolor = color.white,
+                 style     = labelBelow ? label.style_label_upper_left : label.style_label_lower_left,
+                 size      = size.small)
     [l, lb]
 
+// Proximity threshold for overlap detection (fraction of ATR)
+float overlapThresh = atr * 0.15
+
+// Helper: is a BSL/SSL level close to PDH or PDL?
+nearPDHL(float lvl) =>
+    (not na(pdHigh) and math.abs(lvl - pdHigh) < overlapThresh) or (not na(pdLow)  and math.abs(lvl - pdLow)  < overlapThresh)
+
 if array.size(liqLevels) > 0
-    float dBSLBest = na   
+    float dBSLBest = na
     int dBSLTime = na
-    float dSSLBest = na   
+    float dSSLBest = na
     int dSSLTime = na
-    float hBSLBest = na   
+    float hBSLBest = na
     int hBSLTime = na
-    float hSSLBest = na   
+    float hSSLBest = na
     int hSSLTime = na
 
     for i = 0 to array.size(liqLevels) - 1
@@ -260,101 +348,94 @@ if array.size(liqLevels) > 0
         bool is4H    = lq.tfName == "4H"
         if lq.isBSL and lq.level > close
             if isDaily and (na(dBSLBest) or lq.level < dBSLBest)
-                dBSLBest := lq.level    
+                dBSLBest := lq.level
                 dBSLTime := lq.pivotTime
             else if is4H and (na(hBSLBest) or lq.level < hBSLBest)
-                hBSLBest := lq.level    
+                hBSLBest := lq.level
                 hBSLTime := lq.pivotTime
         if not lq.isBSL and lq.level < close
             if isDaily and (na(dSSLBest) or lq.level > dSSLBest)
-                dSSLBest := lq.level    
+                dSSLBest := lq.level
                 dSSLTime := lq.pivotTime
             else if is4H and (na(hSSLBest) or lq.level > hSSLBest)
-                hSSLBest := lq.level    
+                hSSLBest := lq.level
                 hSSLTime := lq.pivotTime
 
-    // 1D BSL
+    // ── 1D BSL ──
     if not na(dBSLBest)
         if na(shownDailyBSL) or shownDailyBSL != dBSLTime
             del_ll(dBSLLine, dBSLLabel)
-            [nl, nlb] = draw_ll(dBSLBest, "1D BSL", LIQ_D_COLOR)
-            dBSLLine := nl    
-            dBSLLabel := nlb    
+            [nl, nlb] = draw_ll(dBSLBest, "1D BSL", LIQ_D_COLOR, nearPDHL(dBSLBest))
+            dBSLLine := nl
+            dBSLLabel := nlb
             shownDailyBSL := dBSLTime
         else
-            if not na(dBSLLine)
-                dBSLLine.set_y1(dBSLBest)    
-                dBSLLine.set_y2(dBSLBest)
-            if not na(dBSLLabel)
-                dBSLLabel.set_y(dBSLBest)    
-                dBSLLabel.set_x(bar_index)
+            // Redraw at current bar_index so line tracks current bar
+            del_ll(dBSLLine, dBSLLabel)
+            [nl, nlb] = draw_ll(dBSLBest, "1D BSL", LIQ_D_COLOR, nearPDHL(dBSLBest))
+            dBSLLine  := nl
+            dBSLLabel := nlb
     else
         del_ll(dBSLLine, dBSLLabel)
-        dBSLLine := na    
-        dBSLLabel := na    
+        dBSLLine := na
+        dBSLLabel := na
         shownDailyBSL := na
 
-    // 1D SSL
+    // ── 1D SSL ──
     if not na(dSSLBest)
         if na(shownDailySSL) or shownDailySSL != dSSLTime
             del_ll(dSSLLine, dSSLLabel)
-            [nl, nlb] = draw_ll(dSSLBest, "1D SSL", LIQ_D_COLOR)
-            dSSLLine := nl    
-            dSSLLabel := nlb    
+            [nl, nlb] = draw_ll(dSSLBest, "1D SSL", LIQ_D_COLOR, nearPDHL(dSSLBest))
+            dSSLLine := nl
+            dSSLLabel := nlb
             shownDailySSL := dSSLTime
         else
-            if not na(dSSLLine)
-                dSSLLine.set_y1(dSSLBest)    
-                dSSLLine.set_y2(dSSLBest)
-            if not na(dSSLLabel)
-                dSSLLabel.set_y(dSSLBest)    
-                dSSLLabel.set_x(bar_index)
+            del_ll(dSSLLine, dSSLLabel)
+            [nl, nlb] = draw_ll(dSSLBest, "1D SSL", LIQ_D_COLOR, nearPDHL(dSSLBest))
+            dSSLLine  := nl
+            dSSLLabel := nlb
     else
         del_ll(dSSLLine, dSSLLabel)
-        dSSLLine := na    
-        dSSLLabel := na    
+        dSSLLine := na
+        dSSLLabel := na
         shownDailySSL := na
 
-    // 4H BSL
+    // ── 4H BSL ──
     if not na(hBSLBest)
         if na(shown4hBSL) or shown4hBSL != hBSLTime
             del_ll(hBSLLine, hBSLLabel)
-            [nl, nlb] = draw_ll(hBSLBest, "4H BSL", LIQ_4_COLOR)
-            hBSLLine := nl    
-            hBSLLabel := nlb    
+            [nl, nlb] = draw_ll(hBSLBest, "4H BSL", LIQ_4_COLOR, nearPDHL(hBSLBest))
+            hBSLLine := nl
+            hBSLLabel := nlb
             shown4hBSL := hBSLTime
         else
-            if not na(hBSLLine)
-                hBSLLine.set_y1(hBSLBest)
-                hBSLLine.set_y2(hBSLBest)
-            if not na(hBSLLabel)
-                hBSLLabel.set_y(hBSLBest)
-                hBSLLabel.set_x(bar_index)
+            del_ll(hBSLLine, hBSLLabel)
+            [nl, nlb] = draw_ll(hBSLBest, "4H BSL", LIQ_4_COLOR, nearPDHL(hBSLBest))
+            hBSLLine  := nl
+            hBSLLabel := nlb
     else
         del_ll(hBSLLine, hBSLLabel)
-        hBSLLine := na   
-        hBSLLabel := na    
+        hBSLLine := na
+        hBSLLabel := na
         shown4hBSL := na
 
-    // 4H SSL
+    // ── 4H SSL ──
     if not na(hSSLBest)
         if na(shown4hSSL) or shown4hSSL != hSSLTime
             del_ll(hSSLLine, hSSLLabel)
-            [nl, nlb] = draw_ll(hSSLBest, "4H SSL", LIQ_4_COLOR)
-            hSSLLine := nl    
-            hSSLLabel := nlb    
+            [nl, nlb] = draw_ll(hSSLBest, "4H SSL", LIQ_4_COLOR, nearPDHL(hSSLBest))
+            hSSLLine := nl
+            hSSLLabel := nlb
             shown4hSSL := hSSLTime
         else
-            if not na(hSSLLine)
-                hSSLLine.set_y1(hSSLBest)    
-                hSSLLine.set_y2(hSSLBest)
-            if not na(hSSLLabel)
-                hSSLLabel.set_y(hSSLBest)    
-                hSSLLabel.set_x(bar_index)
+            del_ll(hSSLLine, hSSLLabel)
+            [nl, nlb] = draw_ll(hSSLBest, "4H SSL", LIQ_4_COLOR, nearPDHL(hSSLBest))
+            hSSLLine  := nl
+            hSSLLabel := nlb
     else
         del_ll(hSSLLine, hSSLLabel)
-        hSSLLine := na    
-        hSSLLabel := na    
+        hSSLLine := na
+        hSSLLabel := na
         shown4hSSL := na
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -390,34 +471,40 @@ while array.size(processed4HTimes) > 200
     array.remove(processed4HTimes, 0)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STOCH RSI CONFLUENCE SIGNALS
-//
-// Trigger conditions (all must be true on the same confirmed bar):
-//
-//   LONG confluence:
-//     1. Stoch RSI K crosses ABOVE D  (momentum turning up)
-//     2. Both K and D are at or below the oversold level (≤ 20)
-//     3. Price (close) is inside an active demand zone
-//
-//   SHORT confluence:
-//     1. Stoch RSI K crosses BELOW D  (momentum turning down)
-//     2. Both K and D are at or above the overbought level (≥ 80)
-//     3. Price (close) is inside an active supply zone
-//
-// Signal fires on bar close only (barstate.isconfirmed) — no repainting.
-// A small label is plotted on the price chart at the signal bar.
+// CONFLUENCE SIGNALS  (Stoch RSI + S&D zone + EMA + VWAP)
 // ─────────────────────────────────────────────────────────────────────────────
-bool kCrossAboveD = ta.crossover(stochK,  stochD)   // K just crossed above D
-bool kCrossBelowD = ta.crossunder(stochK, stochD)   // K just crossed below D
+bool kCrossAboveD = ta.crossover(stochK,  stochD)
+bool kCrossBelowD = ta.crossunder(stochK, stochD)
 
-bool longSetup  = kCrossAboveD and stochK <= srsiOS and stochD <= srsiOS and inDemandZone()
-bool shortSetup = kCrossBelowD and stochK >= srsiOB and stochD >= srsiOB and inSupplyZone()
+bool baseLong  = kCrossAboveD and stochK <= srsiOS and stochD <= srsiOS and inDemandZone()
+bool baseShort = kCrossBelowD and stochK >= srsiOB and stochD >= srsiOB and inSupplyZone()
 
-// Fire on bar close only to prevent intra-bar repainting
+bool emaLongOK    = not useEMABias     or emaBullStack
+bool emaShortOK   = not useEMABias     or emaBearStack
+bool slowLongOK   = not useEMASlowBias or emaBullBias
+bool slowShortOK  = not useEMASlowBias or emaBearBias
+bool vwapLongOK   = not useVWAPBias    or aboveVWAP
+bool vwapShortOK  = not useVWAPBias    or belowVWAP
+
+bool longSetup  = baseLong  and emaLongOK  and slowLongOK  and vwapLongOK
+bool shortSetup = baseShort and emaShortOK and slowShortOK and vwapShortOK
+
+buildConfluenceText(bool isLong) =>
+    string txt = isLong ? "⬆ Long" : "⬇ Short"
+    txt := txt + "\nStochRSI " + (isLong ? "OS" : "OB")
+    txt := txt + "\n+ " + (isLong ? "Demand" : "Supply") + " Zone"
+    if useEMABias
+        txt := txt + "\n+ EMA " + str.tostring(emaFastLen) + "/" + str.tostring(emaMidLen)
+    if useEMASlowBias
+        txt := txt + "\n+ " + str.tostring(emaSlowLen) + " EMA bias"
+    if useVWAPBias
+        txt := txt + "\n+ VWAP"
+    txt
+
 if showConfluence and barstate.isconfirmed
     if longSetup
         label.new(bar_index, low,
-             "⬆ Long\nStochRSI OS\n+ Demand Zone",
+             buildConfluenceText(true),
              color     = color.new(BULL_COLOR, 15),
              textcolor = color.white,
              style     = label.style_label_up,
@@ -426,12 +513,15 @@ if showConfluence and barstate.isconfirmed
 
     if shortSetup
         label.new(bar_index, high,
-             "⬇ Short\nStochRSI OB\n+ Supply Zone",
+             buildConfluenceText(false),
              color     = color.new(BEAR_COLOR, 15),
              textcolor = color.white,
              style     = label.style_label_down,
              size      = size.small,
              yloc      = yloc.abovebar)
+
+alertcondition(longSetup,  "Long Confluence",  "S&D+HTF: Long confluence (StochRSI + Demand + filters)")
+alertcondition(shortSetup, "Short Confluence", "S&D+HTF: Short confluence (StochRSI + Supply + filters)")
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DAILY BIAS LABEL  (ICT methodology)
