@@ -1,0 +1,178 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © acekavi
+
+//@version=6
+indicator("Liquidity Sweeps & IFVG Visualizer [acekavi]", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+// --- Groups ---
+string G_SENS     = "Sensitivity"
+string G_VIS      = "Visuals"
+string G_FILT     = "Filters"
+
+// --- Inputs ---
+int pivotLen      = input.int(10, "Liquidity Lookback", minval = 1, group = G_SENS, tooltip = "Lookback period to find swing highs/lows.")
+int sweepExpiry   = input.int(50, "Sweep Validity (Bars)", minval = 1, group = G_SENS, tooltip = "How many bars a sweep remains 'active' for an IFVG setup.")
+
+bool showFVGs     = input.bool(true, "Show Active FVGs", group = G_VIS)
+bool showIFVGs    = input.bool(true, "Highlight IFVGs", group = G_VIS)
+bool showZones    = input.bool(true, "Show Liquidity Lines", group = G_VIS)
+bool highlightSwp = input.bool(true, "Highlight Sweep Candle", group = G_VIS)
+
+color bullColor   = input.color(#089981, "Bullish Color", group = G_VIS)
+color bearColor   = input.color(#f23645, "Bearish Color", group = G_VIS)
+color liqColor    = input.color(color.gray, "Liquidity Color", group = G_VIS)
+
+float fvgMinSize  = input.float(0.0, "Min FVG Size (ATR %)", minval = 0.0, step = 0.1, group = G_FILT) / 100
+
+// --- Types ---
+type FVG
+    float top
+    float bottom
+    bool  isBull
+    int   barIndex
+    box   visual
+
+type LiquidityLevel
+    float price
+    int   startBar
+    line  ln
+    bool  isHigh
+
+// --- Global Variables ---
+var FVG[] activeFVGs = array.new<FVG>()
+var LiquidityLevel[] levels = array.new<LiquidityLevel>()
+
+var int   lastSweepBar  = 0
+var bool  isBullSweepActive = false
+var bool  isBearSweepActive = false
+
+float atr = ta.atr(14)
+
+// --- Liquidity Logic ---
+float ph = ta.pivothigh(pivotLen, pivotLen)
+float pl = ta.pivotlow(pivotLen, pivotLen)
+
+// Create New Liquidity Levels
+if not na(ph)
+    line l = showZones ? line.new(bar_index[pivotLen], ph, bar_index, ph, color = color.new(liqColor, 50), style = line.style_dashed) : na
+    levels.push(LiquidityLevel.new(ph, bar_index - pivotLen, l, true))
+
+if not na(pl)
+    line l = showZones ? line.new(bar_index[pivotLen], pl, bar_index, pl, color = color.new(liqColor, 50), style = line.style_dashed) : na
+    levels.push(LiquidityLevel.new(pl, bar_index - pivotLen, l, false))
+
+// Process and Detect Sweeps
+bool signalLong  = false
+bool signalShort = false
+bool sweptThisBar = false
+
+if levels.size() > 0
+    for i = levels.size() - 1 to 0
+        LiquidityLevel lvl = levels.get(i)
+        bool levelSwept = false
+        
+        if lvl.isHigh
+            // Bearish Sweep: Price goes above high level and closes below
+            if high > lvl.price
+                levelSwept := true
+                if close < lvl.price
+                    isBearSweepActive := true
+                    isBullSweepActive := false
+                    lastSweepBar      := bar_index
+                    sweptThisBar      := true
+                    label.new(bar_index, high, "SH Sweep", style = label.style_label_down, color = bearColor, textcolor = color.white, size = size.small)
+            else
+                if not na(lvl.ln)
+                    lvl.ln.set_x2(bar_index)
+        else
+            // Bullish Sweep: Price goes below low level and closes above
+            if low < lvl.price
+                levelSwept := true
+                if close > lvl.price
+                    isBullSweepActive := true
+                    isBearSweepActive := false
+                    lastSweepBar      := bar_index
+                    sweptThisBar      := true
+                    label.new(bar_index, low, "SL Sweep", style = label.style_label_up, color = bullColor, textcolor = color.white, size = size.small)
+            else
+                if not na(lvl.ln)
+                    lvl.ln.set_x2(bar_index)
+        
+        if levelSwept
+            if not na(lvl.ln)
+                lvl.ln.set_style(line.style_solid)
+                lvl.ln.set_color(color.new(liqColor, 80))
+            levels.remove(i)
+
+// Highlight Sweep Candle
+bgcolor(highlightSwp and sweptThisBar ? color.new(liqColor, 80) : na)
+
+// Clear sweep activity if expired
+if bar_index - lastSweepBar > sweepExpiry
+    isBullSweepActive := false
+    isBearSweepActive := false
+
+// --- FVG Logic ---
+bool bullFVG = low > high[2] and close[1] > high[2]
+bool bearFVG = high < low[2] and close[1] < low[2]
+
+if bullFVG
+    float size_ = low - high[2]
+    if size_ >= (nz(atr[1]) * fvgMinSize)
+        box b = showFVGs ? box.new(bar_index - 2, low, bar_index, high[2], bgcolor = color.new(bullColor, 90), border_color = na) : na
+        activeFVGs.push(FVG.new(low, high[2], true, bar_index - 1, b))
+else if bearFVG
+    float size_ = low[2] - high
+    if size_ >= (nz(atr[1]) * fvgMinSize)
+        box b = showFVGs ? box.new(bar_index - 2, low[2], bar_index, high, bgcolor = color.new(bearColor, 90), border_color = na) : na
+        activeFVGs.push(FVG.new(low[2], high, false, bar_index - 1, b))
+
+// --- Inversion Check ---
+if activeFVGs.size() > 0
+    for i = activeFVGs.size() - 1 to 0
+        FVG f = activeFVGs.get(i)
+        bool inverted = false
+        
+        if f.isBull and close < f.bottom 
+            inverted := true
+            if isBearSweepActive and bar_index - lastSweepBar <= sweepExpiry
+                signalShort := true
+                isBearSweepActive := false 
+            
+            if showIFVGs and not na(f.visual)
+                f.visual.set_bgcolor(color.new(bearColor, 70))
+                f.visual.set_border_color(bearColor)
+                f.visual.set_right(bar_index + 5)
+
+        else if not f.isBull and close > f.top 
+            inverted := true
+            if isBullSweepActive and bar_index - lastSweepBar <= sweepExpiry
+                signalLong := true
+                isBullSweepActive := false
+                
+            if showIFVGs and not na(f.visual)
+                f.visual.set_bgcolor(color.new(bullColor, 70))
+                f.visual.set_border_color(bullColor)
+                f.visual.set_right(bar_index + 5)
+
+        if inverted
+            activeFVGs.remove(i)
+        else if (f.isBull and low < f.bottom) or (not f.isBull and high > f.top)
+            if not na(f.visual)
+                f.visual.delete()
+            activeFVGs.remove(i)
+
+// Signals
+plotshape(signalLong, "Long Setup", shape.triangleup, location.belowbar, bullColor, size = size.small, text = "IFVG Long")
+plotshape(signalShort, "Short Setup", shape.triangledown, location.abovebar, bearColor, size = size.small, text = "IFVG Short")
+
+// Cleanup
+if levels.size() > 50
+    LiquidityLevel old = levels.remove(0)
+    if not na(old.ln)
+        old.ln.delete()
+
+if activeFVGs.size() > 50
+    FVG old = activeFVGs.remove(0)
+    if not na(old.visual)
+        old.visual.delete()
