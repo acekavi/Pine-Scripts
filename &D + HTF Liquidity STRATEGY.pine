@@ -1,0 +1,657 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// @version=6
+// © acekavi
+// =============================================================================
+// S&D + HTF Liquidity STRATEGY  —  Stoch RSI + EMA + VWAP confluence
+// Designed for 5-min chart backtesting. Optimised for crypto: BTC, ETH, SOL (USDT perps).
+// =============================================================================
+strategy("S&D + HTF Liquidity Strategy", "S&D+HTF Strat",
+     overlay              = true,
+     max_boxes_count      = 100,
+     max_lines_count      = 200,
+     max_labels_count     = 200,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.percent_of_equity,
+     default_qty_value    = 1,           // risk 1% per trade (adjust in Settings)
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.05,        // ~0.05% per side — Binance/Bybit taker fee
+     slippage             = 2,           // 2 ticks slippage per fill
+     pyramiding           = 0,           // no stacking of positions
+     calc_on_order_fills  = false,
+     process_orders_on_close = false)    // fills on next bar open — realistic
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COLORS
+// ─────────────────────────────────────────────────────────────────────────────
+color BULL_COLOR  = #089981
+color BEAR_COLOR  = #f23645
+color LIQ_D_COLOR = #5b9cf6
+color LIQ_4_COLOR = #9c5bf6
+color EMA_FAST_COLOR = #ffeb3b
+color EMA_MID_COLOR  = #ff9800
+color EMA_SLOW_COLOR = #e91e63
+color VWAP_COLOR     = #00bcd4
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS — Supply & Demand
+// ─────────────────────────────────────────────────────────────────────────────
+int   lookbackInput = input.int(14,    "ATR Period",              minval = 1,                group = "Supply & Demand")
+float strengthInput = input.float(1.2, "Move Strength (ATR ×)",   minval = 0.1, step = 0.1, group = "Supply & Demand")
+int   maxZonesInput = input.int(5,     "Max Zones per Type",      minval = 1,   maxval = 50, group = "Supply & Demand")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS — HTF Swings
+// ─────────────────────────────────────────────────────────────────────────────
+int  pivotLookback = input.int(3,    "Pivot Lookback",            minval = 1,                group = "HTF Swings")
+bool showDaily     = input.bool(true, "Show Daily Swings",                                   group = "HTF Swings")
+bool show4H        = input.bool(true, "Show 4H Swings",                                      group = "HTF Swings")
+bool showPDHL      = input.bool(true, "Show Prev Day High/Low",                              group = "HTF Swings")
+int  maxLiqLines   = input.int(10,   "Max Tracked Levels per TF", minval = 1,   maxval = 30, group = "HTF Swings")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS — Stoch RSI
+// ─────────────────────────────────────────────────────────────────────────────
+int   srsiLengthRSI = input.int(14,  "RSI Length",    minval = 1, group = "Stoch RSI")
+int   srsiLengthK   = input.int(14,  "Stoch Length",  minval = 1, group = "Stoch RSI")
+int   srsiSmoothK   = input.int(3,   "K Smoothing",   minval = 1, group = "Stoch RSI")
+int   srsiSmoothD   = input.int(3,   "D Smoothing",   minval = 1, group = "Stoch RSI")
+float srsiOB        = input.float(80, "Overbought",   minval = 50, maxval = 100, group = "Stoch RSI")
+float srsiOS        = input.float(20, "Oversold",     minval = 0,  maxval = 50,  group = "Stoch RSI")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS — EMA & VWAP filters
+// ─────────────────────────────────────────────────────────────────────────────
+bool  showEMAs       = input.bool(true, "Show EMAs",                                              group = "EMA & VWAP")
+int   emaFastLen     = input.int(9,    "Fast EMA",         minval = 1,                            group = "EMA & VWAP")
+int   emaMidLen      = input.int(21,   "Mid EMA",          minval = 1,                            group = "EMA & VWAP")
+int   emaSlowLen     = input.int(50,   "Slow EMA (Bias)",  minval = 1,                            group = "EMA & VWAP")
+bool  useEMABias     = input.bool(true, "Filter: EMA Trend Alignment (fast vs mid)",              group = "EMA & VWAP")
+bool  useEMASlowBias = input.bool(true, "Filter: Slow EMA Bias (close vs 50 EMA)",               group = "EMA & VWAP")
+bool  showVWAP       = input.bool(true, "Show VWAP",                                              group = "EMA & VWAP")
+bool  useVWAPBias    = input.bool(true, "Filter: VWAP Side Alignment",                            group = "EMA & VWAP")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS — Risk Management
+// ─────────────────────────────────────────────────────────────────────────────
+float slAtrMult  = input.float(2.0, "Stop Loss (ATR ×)",        minval = 0.5, step = 0.1, group = "Risk Management",
+     tooltip = "SL = entry ± (ATR × multiplier). Wider = more room, fewer stops out.")
+float tp1AtrMult = input.float(3.5, "TP1 (ATR ×)",              minval = 0.5, step = 0.1, group = "Risk Management",
+     tooltip = "First profit target. Close 50% of position here and move SL to breakeven.")
+float tp2AtrMult = input.float(6.0, "TP2 (ATR ×)",              minval = 1.0, step = 0.5, group = "Risk Management",
+     tooltip = "Second profit target for the remaining 50%. Aim for HTF BSL/SSL level.")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS — Crypto Session Filter (UTC)
+//
+// Three high-volatility windows backed by Binance orderbook research:
+//   Asian Open   00:00–03:00 UTC — Asia/Pacific desks open, BTC often sets
+//                                   the early directional bias for the day.
+//   EU / London  07:00–10:00 UTC — European institutional flow enters;
+//                                   clean breakouts from the Asian range.
+//   US Session   13:00–17:00 UTC — Highest liquidity peak (11:00 UTC peak on
+//                                   Binance); overlaps with US equity open and
+//                                   CME futures activity. Best S&D signals.
+//
+// Dead zone (avoid): 21:00–23:59 UTC — lowest depth, widest spreads, bot-driven.
+// All times in UTC. Crypto never closes so no DST adjustment needed.
+// ─────────────────────────────────────────────────────────────────────────────
+bool  useKillZone    = input.bool(true,  "Enable Session Filter",        group = "Crypto Sessions (UTC)")
+bool  showAsian      = input.bool(true,  "Asian Open  (default 00–03)",  group = "Crypto Sessions (UTC)")
+int   asianStart     = input.int(0,      "Asian Start (HHMM UTC)",       minval = 0, maxval = 2359, group = "Crypto Sessions (UTC)")
+int   asianEnd       = input.int(300,    "Asian End   (HHMM UTC)",       minval = 0, maxval = 2359, group = "Crypto Sessions (UTC)")
+bool  showEU         = input.bool(true,  "EU / London (default 07–10)",  group = "Crypto Sessions (UTC)")
+int   euStart        = input.int(700,    "EU Start    (HHMM UTC)",       minval = 0, maxval = 2359, group = "Crypto Sessions (UTC)")
+int   euEnd          = input.int(1000,   "EU End      (HHMM UTC)",       minval = 0, maxval = 2359, group = "Crypto Sessions (UTC)")
+bool  showUS         = input.bool(true,  "US Session  (default 13–17)",  group = "Crypto Sessions (UTC)")
+int   usStart        = input.int(1300,   "US Start    (HHMM UTC)",       minval = 0, maxval = 2359, group = "Crypto Sessions (UTC)")
+int   usEnd          = input.int(1700,   "US End      (HHMM UTC)",       minval = 0, maxval = 2359, group = "Crypto Sessions (UTC)")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS — Backtest Date Range
+// ─────────────────────────────────────────────────────────────────────────────
+bool   useDate     = input.bool(false, "Restrict Backtest Date Range", group = "Backtest Date Range")
+int    startYear   = input.int(2023,   "Start Year",  minval = 2000,   group = "Backtest Date Range")
+int    startMonth  = input.int(1,      "Start Month", minval = 1, maxval = 12, group = "Backtest Date Range")
+int    startDay    = input.int(1,      "Start Day",   minval = 1, maxval = 31, group = "Backtest Date Range")
+int    endYear     = input.int(2025,   "End Year",    minval = 2000,   group = "Backtest Date Range")
+int    endMonth    = input.int(12,     "End Month",   minval = 1, maxval = 12, group = "Backtest Date Range")
+int    endDay      = input.int(31,     "End Day",     minval = 1, maxval = 31, group = "Backtest Date Range")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TYPES
+// ─────────────────────────────────────────────────────────────────────────────
+type Zone
+    box   id
+    float top
+    float bottom
+    bool  isBull
+    bool  mitigated
+
+type Liquidity
+    line  id
+    label lbl
+    float level
+    bool  isBSL
+    bool  swept
+    int   pivotTime
+    string tfName
+    color  tfColor
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GLOBAL STATE
+// ─────────────────────────────────────────────────────────────────────────────
+var demandZones  = array.new<Zone>()
+var supplyZones  = array.new<Zone>()
+var liqLevels    = array.new<Liquidity>()
+
+var processedDailyTimes = array.new<int>()
+var processed4HTimes    = array.new<int>()
+
+var line  dBSLLine  = na
+var label dBSLLabel = na
+var line  dSSLLine  = na
+var label dSSLLabel = na
+var line  hBSLLine  = na
+var label hBSLLabel = na
+var line  hSSLLine  = na
+var label hSSLLabel = na
+
+var int shownDailyBSL = na
+var int shownDailySSL = na
+var int shown4hBSL    = na
+var int shown4hSSL    = na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DATE RANGE FILTER
+// ─────────────────────────────────────────────────────────────────────────────
+startTime = timestamp(startYear, startMonth, startDay, 0, 0)
+endTime   = timestamp(endYear,   endMonth,   endDay,   23, 59)
+inDateRange = not useDate or (time >= startTime and time <= endTime)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CRYPTO SESSION FILTER  (UTC — no DST, works on any exchange)
+// Converts HHMM integer to minutes-since-midnight for clean comparison
+// ─────────────────────────────────────────────────────────────────────────────
+hhmm_to_mins(int hhmm) =>
+    (hhmm / 100) * 60 + (hhmm % 100)
+
+int   curH     = hour(time, "UTC")
+int   curM     = minute(time, "UTC")
+int   curMins  = curH * 60 + curM
+
+int   asianS   = hhmm_to_mins(asianStart)
+int   asianE   = hhmm_to_mins(asianEnd)
+int   euS      = hhmm_to_mins(euStart)
+int   euE      = hhmm_to_mins(euEnd)
+int   usS      = hhmm_to_mins(usStart)
+int   usE      = hhmm_to_mins(usEnd)
+
+bool inAsian   = showAsian and curMins >= asianS and curMins < asianE
+bool inEU      = showEU    and curMins >= euS    and curMins < euE
+bool inUS      = showUS    and curMins >= usS    and curMins < usE
+bool inKillZone = not useKillZone or inAsian or inEU or inUS
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EMA CALCULATIONS
+// ─────────────────────────────────────────────────────────────────────────────
+float emaFast = ta.ema(close, emaFastLen)
+float emaMid  = ta.ema(close, emaMidLen)
+float emaSlow = ta.ema(close, emaSlowLen)
+
+plot(showEMAs ? emaFast : na, "Fast EMA", color = color.new(EMA_FAST_COLOR, 0), linewidth = 1)
+plot(showEMAs ? emaMid  : na, "Mid EMA",  color = color.new(EMA_MID_COLOR,  0), linewidth = 1)
+plot(showEMAs ? emaSlow : na, "Slow EMA", color = color.new(EMA_SLOW_COLOR, 0), linewidth = 2)
+
+bool emaBullStack = emaFast > emaMid
+bool emaBearStack = emaFast < emaMid
+bool emaBullBias  = close   > emaSlow
+bool emaBearBias  = close   < emaSlow
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VWAP
+// ─────────────────────────────────────────────────────────────────────────────
+float vwapVal = ta.vwap(hlc3)
+
+plot(showVWAP and timeframe.isintraday ? vwapVal : na, "VWAP",
+     color = color.new(VWAP_COLOR, 0), linewidth = 1, style = plot.style_line)
+
+bool aboveVWAP = close > vwapVal
+bool belowVWAP = close < vwapVal
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STOCHASTIC RSI
+// ─────────────────────────────────────────────────────────────────────────────
+float rsiVal = ta.rsi(close, srsiLengthRSI)
+float stochK = ta.sma(ta.stoch(rsiVal, rsiVal, rsiVal, srsiLengthK), srsiSmoothK)
+float stochD = ta.sma(stochK, srsiSmoothD)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ATR — used for SL/TP calculation
+// ─────────────────────────────────────────────────────────────────────────────
+float atr = ta.atr(lookbackInput)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PREVIOUS DAY HIGH / LOW
+// ─────────────────────────────────────────────────────────────────────────────
+float pdHigh = request.security(syminfo.tickerid, "1D", high[1], lookahead = barmerge.lookahead_on)
+float pdLow  = request.security(syminfo.tickerid, "1D", low[1],  lookahead = barmerge.lookahead_on)
+
+var line  pdHighLine  = na
+var line  pdLowLine   = na
+var label pdHighLabel = na
+var label pdLowLabel  = na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS: fixed-width line + opaque label
+// ─────────────────────────────────────────────────────────────────────────────
+draw_fixed_line(float lvl, string txt, color col) =>
+    int x1 = bar_index - 5
+    int x2 = bar_index + 5
+    line  l  = line.new(x1, lvl, x2, lvl,
+                 color = color.new(col, 20), style = line.style_dashed, width = 1)
+    label lb = label.new(x2, lvl, txt,
+                 color     = color.new(col, 20),
+                 textcolor = color.white,
+                 style     = label.style_label_left,
+                 size      = size.small)
+    [l, lb]
+
+del_ll(line l, label lb) =>
+    if not na(l)
+        l.delete()
+    if not na(lb)
+        lb.delete()
+
+float overlapThresh = atr * 0.15
+
+nearPDHL(float lvl) =>
+    (not na(pdHigh) and math.abs(lvl - pdHigh) < overlapThresh) or (not na(pdLow)  and math.abs(lvl - pdLow)  < overlapThresh)
+
+draw_ll(float lvl, string txt, color col, bool labelBelow = false) =>
+    int x1 = bar_index - 5
+    int x2 = bar_index + 5
+    line  l  = line.new(x1, lvl, x2, lvl,
+                 color = color.new(col, 30), style = line.style_dashed, width = 1)
+    label lb = label.new(x2, lvl, txt,
+                 color     = color.new(col, 20),
+                 textcolor = color.white,
+                 style     = labelBelow ? label.style_label_upper_left : label.style_label_lower_left,
+                 size      = size.small)
+    [l, lb]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PDH / PDL — redraw every bar
+// ─────────────────────────────────────────────────────────────────────────────
+if showPDHL and timeframe.isintraday
+    if not na(pdHighLine)
+        pdHighLine.delete()
+    if not na(pdLowLine)
+        pdLowLine.delete()
+    if not na(pdHighLabel)
+        pdHighLabel.delete()
+    if not na(pdLowLabel)
+        pdLowLabel.delete()
+
+    [hl, hlb] = draw_fixed_line(pdHigh, "PDH", LIQ_D_COLOR)
+    pdHighLine  := hl
+    pdHighLabel := hlb
+
+    [ll2, llb] = draw_fixed_line(pdLow, "PDL", LIQ_D_COLOR)
+    pdLowLine  := ll2
+    pdLowLabel := llb
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUPPLY & DEMAND ZONE CREATION
+// ─────────────────────────────────────────────────────────────────────────────
+float body         = math.abs(close - open)
+bool  isStrongUp   = close > open and body > atr * strengthInput
+bool  isStrongDown = close < open and body > atr * strengthInput
+bool  baseIsBearish = open[1] > close[1]
+bool  baseIsBullish = open[1] < close[1]
+
+if isStrongUp and baseIsBearish
+    box zBox = box.new(bar_index - 1, high[1], bar_index, low[1],
+         border_color = color.new(BULL_COLOR, 50),
+         bgcolor      = color.new(BULL_COLOR, 85), extend = extend.right)
+    array.push(demandZones, Zone.new(zBox, high[1], low[1], true, false))
+
+if isStrongDown and baseIsBullish
+    box zBox = box.new(bar_index - 1, high[1], bar_index, low[1],
+         border_color = color.new(BEAR_COLOR, 50),
+         bgcolor      = color.new(BEAR_COLOR, 85), extend = extend.right)
+    array.push(supplyZones, Zone.new(zBox, high[1], low[1], false, false))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTF PIVOT FETCH
+// ─────────────────────────────────────────────────────────────────────────────
+[phD, plD, timeD] = request.security(syminfo.tickerid, "1D",
+     [ta.pivothigh(high, pivotLookback, pivotLookback)[1],
+      ta.pivotlow (low,  pivotLookback, pivotLookback)[1],
+      time[pivotLookback]],
+     lookahead = barmerge.lookahead_on)
+
+[ph4, pl4, time4] = request.security(syminfo.tickerid, "240",
+     [ta.pivothigh(high, pivotLookback, pivotLookback)[1],
+      ta.pivotlow (low,  pivotLookback, pivotLookback)[1],
+      time[pivotLookback]],
+     lookahead = barmerge.lookahead_on)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REGISTER HTF LEVELS
+// ─────────────────────────────────────────────────────────────────────────────
+register_htf_liq(float pVal, int pTime, bool isBSL, string tfName, color tfColor, array<int> tracker) =>
+    if not na(pVal) and not na(pTime)
+        if array.indexof(tracker, pTime) == -1
+            array.push(tracker, pTime)
+            array.push(liqLevels,
+                 Liquidity.new(na, na, pVal, isBSL, false, pTime, tfName, tfColor))
+
+if showDaily and timeframe.isintraday
+    register_htf_liq(phD, timeD, true,  "1D", LIQ_D_COLOR, processedDailyTimes)
+    register_htf_liq(plD, timeD, false, "1D", LIQ_D_COLOR, processedDailyTimes)
+
+if show4H and timeframe.in_seconds() < timeframe.in_seconds("240")
+    register_htf_liq(ph4, time4, true,  "4H", LIQ_4_COLOR, processed4HTimes)
+    register_htf_liq(pl4, time4, false, "4H", LIQ_4_COLOR, processed4HTimes)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ZONE MANAGEMENT
+// ─────────────────────────────────────────────────────────────────────────────
+manageZones(array<Zone> zoneArray, bool isBull) =>
+    if array.size(zoneArray) > 0
+        for i = array.size(zoneArray) - 1 to 0
+            Zone z = array.get(zoneArray, i)
+            if not z.mitigated
+                bool mitigated = isBull ? close < z.bottom : close > z.top
+                if mitigated
+                    z.mitigated := true
+                    z.id.delete()
+                    array.remove(zoneArray, i)
+        while array.size(zoneArray) > maxZonesInput
+            Zone oldZone = array.remove(zoneArray, 0)
+            oldZone.id.delete()
+
+manageZones(demandZones, true)
+manageZones(supplyZones, false)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ZONE PRESENCE HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+inDemandZone() =>
+    bool result = false
+    int dSize = array.size(demandZones)
+    if dSize > 0
+        for i = 0 to dSize - 1
+            Zone z = array.get(demandZones, i)
+            if not z.mitigated and close >= z.bottom and close <= z.top
+                result := true
+    result
+
+inSupplyZone() =>
+    bool result = false
+    int sSize = array.size(supplyZones)
+    if sSize > 0
+        for i = 0 to sSize - 1
+            Zone z = array.get(supplyZones, i)
+            if not z.mitigated and close >= z.bottom and close <= z.top
+                result := true
+    result
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BSL/SSL LINE MANAGEMENT  (closest level, fixed-width, overlap-aware)
+// ─────────────────────────────────────────────────────────────────────────────
+if array.size(liqLevels) > 0
+    float dBSLBest = na
+    int   dBSLTime = na
+    float dSSLBest = na
+    int   dSSLTime = na
+    float hBSLBest = na
+    int   hBSLTime = na
+    float hSSLBest = na
+    int   hSSLTime = na
+
+    for i = 0 to array.size(liqLevels) - 1
+        Liquidity lq = array.get(liqLevels, i)
+        if lq.swept
+            continue
+        bool isDaily = lq.tfName == "1D"
+        bool is4H    = lq.tfName == "4H"
+        if lq.isBSL and lq.level > close
+            if isDaily and (na(dBSLBest) or lq.level < dBSLBest)
+                dBSLBest := lq.level
+                dBSLTime := lq.pivotTime
+            else if is4H and (na(hBSLBest) or lq.level < hBSLBest)
+                hBSLBest := lq.level
+                hBSLTime := lq.pivotTime
+        if not lq.isBSL and lq.level < close
+            if isDaily and (na(dSSLBest) or lq.level > dSSLBest)
+                dSSLBest := lq.level
+                dSSLTime := lq.pivotTime
+            else if is4H and (na(hSSLBest) or lq.level > hSSLBest)
+                hSSLBest := lq.level
+                hSSLTime := lq.pivotTime
+
+    // 1D BSL
+    if not na(dBSLBest)
+        del_ll(dBSLLine, dBSLLabel)
+        [nl, nlb] = draw_ll(dBSLBest, "1D BSL", LIQ_D_COLOR, nearPDHL(dBSLBest))
+        dBSLLine := nl
+        dBSLLabel := nlb
+        shownDailyBSL := dBSLTime
+    else
+        del_ll(dBSLLine, dBSLLabel)
+        dBSLLine := na
+        dBSLLabel := na
+        shownDailyBSL := na
+
+    // 1D SSL
+    if not na(dSSLBest)
+        del_ll(dSSLLine, dSSLLabel)
+        [nl, nlb] = draw_ll(dSSLBest, "1D SSL", LIQ_D_COLOR, nearPDHL(dSSLBest))
+        dSSLLine := nl
+        dSSLLabel := nlb
+        shownDailySSL := dSSLTime
+    else
+        del_ll(dSSLLine, dSSLLabel)
+        dSSLLine := na
+        dSSLLabel := na
+        shownDailySSL := na
+
+    // 4H BSL
+    if not na(hBSLBest)
+        del_ll(hBSLLine, hBSLLabel)
+        [nl, nlb] = draw_ll(hBSLBest, "4H BSL", LIQ_4_COLOR, nearPDHL(hBSLBest))
+        hBSLLine := nl
+        hBSLLabel := nlb
+        shown4hBSL := hBSLTime
+    else
+        del_ll(hBSLLine, hBSLLabel)
+        hBSLLine := na
+        hBSLLabel := na
+        shown4hBSL := na
+
+    // 4H SSL
+    if not na(hSSLBest)
+        del_ll(hSSLLine, hSSLLabel)
+        [nl, nlb] = draw_ll(hSSLBest, "4H SSL", LIQ_4_COLOR, nearPDHL(hSSLBest))
+        hSSLLine := nl
+        hSSLLabel := nlb
+        shown4hSSL := hSSLTime
+    else
+        del_ll(hSSLLine, hSSLLabel)
+        hSSLLine := na
+        hSSLLabel := na
+        shown4hSSL := na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LIQUIDITY SWEEP DETECTION
+// ─────────────────────────────────────────────────────────────────────────────
+int liqSize = array.size(liqLevels)
+if liqSize > 0
+    for i = liqSize - 1 to 0
+        if i >= array.size(liqLevels)
+            continue
+        Liquidity lq = array.get(liqLevels, i)
+        if not lq.swept
+            bool bslSwept = lq.isBSL     and high > lq.level and close < lq.level
+            bool sslSwept = not lq.isBSL and low  < lq.level and close > lq.level
+            if sslSwept or bslSwept
+                lq.swept := true
+                if not na(lq.id)
+                    lq.id.delete()
+                if not na(lq.lbl)
+                    lq.lbl.delete()
+                array.remove(liqLevels, i)
+
+while array.size(liqLevels) > maxLiqLines * 2
+    Liquidity oldLiq = array.remove(liqLevels, 0)
+    if not na(oldLiq.id)
+        oldLiq.id.delete()
+    if not na(oldLiq.lbl)
+        oldLiq.lbl.delete()
+
+while array.size(processedDailyTimes) > 200
+    array.remove(processedDailyTimes, 0)
+while array.size(processed4HTimes) > 200
+    array.remove(processed4HTimes, 0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFLUENCE CONDITIONS
+// (identical logic to the indicator — barstate.isconfirmed enforced below)
+// ─────────────────────────────────────────────────────────────────────────────
+bool kCrossAboveD = ta.crossover(stochK,  stochD)
+bool kCrossBelowD = ta.crossunder(stochK, stochD)
+
+bool baseLong  = kCrossAboveD and stochK <= srsiOS and stochD <= srsiOS and inDemandZone()
+bool baseShort = kCrossBelowD and stochK >= srsiOB and stochD >= srsiOB and inSupplyZone()
+
+bool emaLongOK   = not useEMABias     or emaBullStack
+bool emaShortOK  = not useEMABias     or emaBearStack
+bool slowLongOK  = not useEMASlowBias or emaBullBias
+bool slowShortOK = not useEMASlowBias or emaBearBias
+bool vwapLongOK  = not useVWAPBias    or aboveVWAP
+bool vwapShortOK = not useVWAPBias    or belowVWAP
+
+bool longSetup  = baseLong  and emaLongOK  and slowLongOK  and vwapLongOK
+bool shortSetup = baseShort and emaShortOK and slowShortOK and vwapShortOK
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DAILY BIAS  (ICT — used here only for display label, not as a hard filter
+//              so you can test with/without it via the EMA/VWAP filters)
+// ─────────────────────────────────────────────────────────────────────────────
+float yd_close = request.security(syminfo.tickerid, "1D", close[1], lookahead = barmerge.lookahead_on)
+float yd_high  = request.security(syminfo.tickerid, "1D", high[1],  lookahead = barmerge.lookahead_on)
+float yd_low   = request.security(syminfo.tickerid, "1D", low[1],   lookahead = barmerge.lookahead_on)
+float pd2_high = request.security(syminfo.tickerid, "1D", high[2],  lookahead = barmerge.lookahead_on)
+float pd2_low  = request.security(syminfo.tickerid, "1D", low[2],   lookahead = barmerge.lookahead_on)
+
+bool bullBias    = yd_close > pd2_high
+bool bearBias    = yd_close < pd2_low
+bool bullLiqGrab = yd_low  < pd2_low  and yd_close > pd2_low  and not bullBias and not bearBias
+bool bearLiqGrab = yd_high > pd2_high and yd_close < pd2_high and not bullBias and not bearBias
+
+string biasText = bullBias ? "▲ Bullish" : bearBias ? "▼ Bearish" :
+     bullLiqGrab ? "▲ Bullish [SSL Grab]" : bearLiqGrab ? "▼ Bearish [BSL Grab]" : "◆ Neutral"
+color  biasBg   = bullBias or bullLiqGrab ? color.new(#089981, 80) :
+     bearBias or bearLiqGrab ? color.new(#f23645, 80) : color.new(color.gray, 80)
+
+var label biasLabel = na
+if barstate.islast
+    if not na(biasLabel)
+        biasLabel.delete()
+    biasLabel := label.new(bar_index, high,
+         "  Daily Bias\n  " + biasText + "  ",
+         xloc = xloc.bar_index, yloc = yloc.abovebar,
+         color = biasBg, textcolor = color.white,
+         style = label.style_label_lower_left, size = size.normal,
+         tooltip = "ICT Bias: yesterday close vs day-before-yesterday range.")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STRATEGY ENTRIES & EXITS
+//
+// Entry:  on bar CLOSE confirmation (isconfirmed) — no repainting
+// Fill:   next bar open (process_orders_on_close = false)
+// SL/TP:  ATR-based, locked at entry
+//
+// Two-target structure:
+//   - "Long TP1" / "Short TP1" closes 50% of position at TP1, moves SL to BE
+//   - "Long TP2" / "Short TP2" closes remaining 50% at TP2
+// ─────────────────────────────────────────────────────────────────────────────
+bool canTrade = barstate.isconfirmed and inKillZone and inDateRange
+
+// ── LONG ────────────────────────────────────────────────────────────────────
+if longSetup and canTrade and strategy.position_size == 0
+    float sl  = close - atr * slAtrMult
+    float tp1 = close + atr * tp1AtrMult
+    float tp2 = close + atr * tp2AtrMult
+
+    strategy.entry("Long", strategy.long)
+
+    // TP1: exit 50% of position
+    strategy.exit("Long TP1", from_entry = "Long",
+         qty_percent = 50,
+         limit       = tp1,
+         stop        = sl,
+         comment     = "TP1")
+
+    // TP2: exit remaining 50% (SL trails to entry after TP1 fills — manual management)
+    strategy.exit("Long TP2", from_entry = "Long",
+         qty_percent = 100,
+         limit       = tp2,
+         stop        = sl,
+         comment     = "TP2")
+
+// ── SHORT ────────────────────────────────────────────────────────────────────
+if shortSetup and canTrade and strategy.position_size == 0
+    float sl  = close + atr * slAtrMult
+    float tp1 = close - atr * tp1AtrMult
+    float tp2 = close - atr * tp2AtrMult
+
+    strategy.entry("Short", strategy.short)
+
+    strategy.exit("Short TP1", from_entry = "Short",
+         qty_percent = 50,
+         limit       = tp1,
+         stop        = sl,
+         comment     = "TP1")
+
+    strategy.exit("Short TP2", from_entry = "Short",
+         qty_percent = 100,
+         limit       = tp2,
+         stop        = sl,
+         comment     = "TP2")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VISUAL ENTRY MARKERS  (separate from indicator labels — no yloc.belowbar conflict)
+// ─────────────────────────────────────────────────────────────────────────────
+if longSetup and canTrade and barstate.isconfirmed
+    label.new(bar_index, low,
+         "⬆ Long\n+KZ",
+         color     = color.new(BULL_COLOR, 15),
+         textcolor = color.white,
+         style     = label.style_label_up,
+         size      = size.small,
+         yloc      = yloc.belowbar)
+
+if shortSetup and canTrade and barstate.isconfirmed
+    label.new(bar_index, high,
+         "⬇ Short\n+KZ",
+         color     = color.new(BEAR_COLOR, 15),
+         textcolor = color.white,
+         style     = label.style_label_down,
+         size      = size.small,
+         yloc      = yloc.abovebar)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CRYPTO SESSION BACKGROUND SHADING  (visual reference only)
+//
+// Colors chosen for clear distinction at a glance:
+//   Asian Open  → amber/orange  — early directional bias, lower volume
+//   EU / London → blue          — European institutional flow, Asian range break
+//   US Session  → teal/green    — peak liquidity, highest-quality S&D signals
+//
+// All three can be toggled independently via the session checkboxes above.
+// ─────────────────────────────────────────────────────────────────────────────
+bgcolor(inAsian ? color.new(#ff9800, 92) : na, title = "Asian Open (00-03 UTC)")
+bgcolor(inEU    ? color.new(LIQ_D_COLOR, 92) : na, title = "EU / London (07-10 UTC)")
+bgcolor(inUS    ? color.new(BULL_COLOR,  92) : na, title = "US Session (13-17 UTC)")
