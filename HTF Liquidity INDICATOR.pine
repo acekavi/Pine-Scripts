@@ -1,0 +1,464 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// @version=6
+// @author=acekavi
+// =============================================================================
+// S&D + HTF Liquidity INDICATOR  —  clean single-closest-level display
+//
+// Changes in this version:
+//   • Only the CLOSEST BSL (above price) and CLOSEST SSL (below price) are
+//     drawn per timeframe (1D and 4H). All other levels are tracked in the
+//     array for sweep detection but their lines/labels are deleted visually.
+//   • Previous Day High and Previous Day Low are drawn as solid lines.
+// =============================================================================
+indicator("S&D + HTF Liquidity", "S&D+HTF Liq",
+     overlay          = true,
+     max_boxes_count  = 100,
+     max_lines_count  = 200,
+     max_labels_count = 100)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COLORS
+// ─────────────────────────────────────────────────────────────────────────────
+color BULL_COLOR  = #089981
+color BEAR_COLOR  = #f23645
+color LIQ_D_COLOR = #5b9cf6
+color LIQ_4_COLOR = #9c5bf6
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+int   lookbackInput = input.int(14,    "ATR Period",            minval = 1,                group = "Supply & Demand")
+float strengthInput = input.float(1.2, "Move Strength (ATR ×)", minval = 0.1, step = 0.1, group = "Supply & Demand")
+int   maxZonesInput = input.int(5,     "Max Zones per Type",    minval = 1,   maxval = 50, group = "Supply & Demand")
+
+int  pivotLookback = input.int(3,    "Pivot Lookback",          minval = 1,                group = "HTF Swings")
+bool showDaily     = input.bool(true, "Show Daily Swings",                                 group = "HTF Swings")
+bool show4H        = input.bool(true, "Show 4H Swings",                                    group = "HTF Swings")
+bool showPDHL      = input.bool(true, "Show Prev Day High/Low",                            group = "HTF Swings")
+int  maxLiqLines   = input.int(10,   "Max Tracked Levels per TF", minval = 1, maxval = 30, group = "HTF Swings")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TYPES
+// ─────────────────────────────────────────────────────────────────────────────
+type Zone
+    box   id
+    float top
+    float bottom
+    bool  isBull
+    bool  mitigated
+
+type Liquidity
+    line  id       // may be na if this level is not the currently visible one
+    label lbl      // may be na if hidden
+    float level
+    bool  isBSL
+    bool  swept
+    int   pivotTime
+    string tfName
+    color  tfColor
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GLOBAL STATE
+// ─────────────────────────────────────────────────────────────────────────────
+var demandZones  = array.new<Zone>()
+var supplyZones  = array.new<Zone>()
+var liqLevels    = array.new<Liquidity>()
+
+var processedDailyTimes = array.new<int>()
+var processed4HTimes    = array.new<int>()
+
+// Persistent visible line/label holders — one BSL + one SSL per TF
+var line  dBSLLine  = na    // 1D BSL visible line
+var label dBSLLabel = na
+var line  dSSLLine  = na    // 1D SSL visible line
+var label dSSLLabel = na
+var line  hBSLLine  = na    // 4H BSL visible line
+var label hBSLLabel = na
+var line  hSSLLine  = na    // 4H SSL visible line
+var label hSSLLabel = na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PREVIOUS DAY HIGH / LOW  (solid lines)
+// ─────────────────────────────────────────────────────────────────────────────
+float pdHigh = request.security(syminfo.tickerid, "1D", high[1],  lookahead = barmerge.lookahead_on)
+float pdLow  = request.security(syminfo.tickerid, "1D", low[1],   lookahead = barmerge.lookahead_on)
+
+var line pdHighLine  = na
+var line pdLowLine   = na
+var label pdHighLabel = na
+var label pdLowLabel  = na
+
+if showPDHL and timeframe.isintraday and barstate.islast
+    if not na(pdHighLine)
+        pdHighLine.delete()
+    if not na(pdLowLine)
+        pdLowLine.delete()
+    if not na(pdHighLabel)
+        pdHighLabel.delete()
+    if not na(pdLowLabel)
+        pdLowLabel.delete()
+
+    int futureTime = timenow + 86400000 * 365
+
+    pdHighLine := line.new(bar_index, pdHigh, bar_index + 100, pdHigh,
+         xloc  = xloc.bar_index,
+         color = color.new(LIQ_D_COLOR, 20),
+         style = line.style_solid,
+         width = 1)
+    pdHighLabel := label.new(bar_index + 1, pdHigh, "PDH",
+         color     = color.new(color.black, 100),
+         textcolor = color.new(LIQ_D_COLOR, 0),
+         style     = label.style_label_right,
+         size      = size.small)
+
+    pdLowLine := line.new(bar_index, pdLow, bar_index + 100, pdLow,
+         xloc  = xloc.bar_index,
+         color = color.new(LIQ_D_COLOR, 20),
+         style = line.style_solid,
+         width = 1)
+    pdLowLabel := label.new(bar_index + 1, pdLow, "PDL",
+         color     = color.new(color.black, 100),
+         textcolor = color.new(LIQ_D_COLOR, 0),
+         style     = label.style_label_right,
+         size      = size.small)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUPPLY & DEMAND ZONE CREATION
+// ICT Order Block rule:
+//   Demand = last BEARISH candle before strong bullish displacement
+//   Supply = last BULLISH candle before strong bearish displacement
+// ─────────────────────────────────────────────────────────────────────────────
+float atr          = ta.atr(lookbackInput)
+float body         = math.abs(close - open)
+bool  isStrongUp   = close > open and body > atr * strengthInput
+bool  isStrongDown = close < open and body > atr * strengthInput
+
+bool baseIsBearish = open[1] > close[1]
+bool baseIsBullish = open[1] < close[1]
+
+if isStrongUp and baseIsBearish
+    float zTop = high[1]
+    float zBot = low[1]
+    box   zBox = box.new(bar_index - 1, zTop, bar_index, zBot,
+         border_color = color.new(BULL_COLOR, 50),
+         bgcolor      = color.new(BULL_COLOR, 85),
+         extend       = extend.right)
+    array.push(demandZones, Zone.new(zBox, zTop, zBot, true, false))
+
+if isStrongDown and baseIsBullish
+    float zTop = high[1]
+    float zBot = low[1]
+    box   zBox = box.new(bar_index - 1, zTop, bar_index, zBot,
+         border_color = color.new(BEAR_COLOR, 50),
+         bgcolor      = color.new(BEAR_COLOR, 85),
+         extend       = extend.right)
+    array.push(supplyZones, Zone.new(zBox, zTop, zBot, false, false))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTF PIVOT FETCH  (non-repainting)
+// ─────────────────────────────────────────────────────────────────────────────
+[phD, plD, timeD] = request.security(syminfo.tickerid, "1D",
+     [ta.pivothigh(high, pivotLookback, pivotLookback)[1],
+      ta.pivotlow (low,  pivotLookback, pivotLookback)[1],
+      time[pivotLookback]],
+     lookahead = barmerge.lookahead_on)
+
+[ph4, pl4, time4] = request.security(syminfo.tickerid, "240",
+     [ta.pivothigh(high, pivotLookback, pivotLookback)[1],
+      ta.pivotlow (low,  pivotLookback, pivotLookback)[1],
+      time[pivotLookback]],
+     lookahead = barmerge.lookahead_on)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REGISTER HTF LEVELS INTO ARRAY (no lines drawn here)
+// Lines are drawn later in the "closest level" selection pass.
+// ─────────────────────────────────────────────────────────────────────────────
+register_htf_liq(float pVal, int pTime, bool isBSL, string tfName, color tfColor, array<int> tracker) =>
+    if not na(pVal) and not na(pTime)
+        if array.indexof(tracker, pTime) == -1
+            array.push(tracker, pTime)
+            // id = na, lbl = na — no line drawn yet; closest-select pass draws them
+            array.push(liqLevels,
+                 Liquidity.new(na, na, pVal, isBSL, false, pTime, tfName, tfColor))
+
+if showDaily and timeframe.isintraday
+    register_htf_liq(phD, timeD, true,  "1D", LIQ_D_COLOR, processedDailyTimes)
+    register_htf_liq(plD, timeD, false, "1D", LIQ_D_COLOR, processedDailyTimes)
+
+if show4H and timeframe.in_seconds() < timeframe.in_seconds("240")
+    register_htf_liq(ph4, time4, true,  "4H", LIQ_4_COLOR, processed4HTimes)
+    register_htf_liq(pl4, time4, false, "4H", LIQ_4_COLOR, processed4HTimes)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ZONE MANAGEMENT
+// Mitigation = close beyond zone boundary (ICT standard — not wick touch)
+// ─────────────────────────────────────────────────────────────────────────────
+manageZones(array<Zone> zoneArray, bool isBull) =>
+    if array.size(zoneArray) > 0
+        for i = array.size(zoneArray) - 1 to 0
+            Zone z = array.get(zoneArray, i)
+            if not z.mitigated
+                bool mitigated = isBull ? close < z.bottom : close > z.top
+                if mitigated
+                    z.mitigated := true
+                    z.id.delete()
+                    array.remove(zoneArray, i)
+        while array.size(zoneArray) > maxZonesInput
+            Zone oldZone = array.remove(zoneArray, 0)
+            oldZone.id.delete()
+
+manageZones(demandZones, true)
+manageZones(supplyZones, false)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLOSEST LEVEL SELECTION + VISIBLE LINE MANAGEMENT
+//
+// For each TF × side combination (1D BSL, 1D SSL, 4H BSL, 4H SSL):
+//   • BSL = Buy-Side Liquidity = above current price → find the LOWEST one above
+//   • SSL = Sell-Side Liquidity = below current price → find the HIGHEST one below
+//
+// We maintain exactly one persistent line/label per slot.
+// Each bar we find the winner level, then update the line price in-place.
+// If the winner changed (different pivotTime) we delete and redraw.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Helper: delete a line+label pair safely
+del_ll(line l, label lb) =>
+    if not na(l)
+        l.delete()
+    if not na(lb)
+        lb.delete()
+
+// Helper: draw a new liq line+label pair, returns [line, label]
+draw_ll(float lvl, string txt, color col) =>
+    int fTime = timenow + 86400000 * 365
+    line  l  = line.new(timenow - (timenow - timenow) * 0, lvl,
+                         fTime, lvl,
+                         xloc      = xloc.bar_time,
+                         color     = color.new(col, 30),
+                         style     = line.style_dashed,
+                         width     = 1)
+    label lb = label.new(bar_index, lvl, txt,
+                         color     = color.new(color.black, 100),
+                         textcolor = color.new(col, 0),
+                         style     = label.style_label_up,
+                         size      = size.small)
+    [l, lb]
+
+// Trackers for which pivotTime is currently shown per slot
+var int shownDailyBSL = na
+var int shownDailySSL = na
+var int shown4hBSL    = na
+var int shown4hSSL    = na
+
+// Run the selection on every bar (cheap — just iterates the small liqLevels array)
+if array.size(liqLevels) > 0
+    // ── Find winners ────────────────────────────────────────────────────────
+    float dBSLBest = na    // closest Daily BSL above price (smallest distance above)
+    int   dBSLTime = na
+    float dSSLBest = na    // closest Daily SSL below price (smallest distance below)
+    int   dSSLTime = na
+    float hBSLBest = na
+    int   hBSLTime = na
+    float hSSLBest = na
+    int   hSSLTime = na
+
+    for i = 0 to array.size(liqLevels) - 1
+        Liquidity lq = array.get(liqLevels, i)
+        if lq.swept
+            continue
+        bool isDaily = lq.tfName == "1D"
+        bool is4H    = lq.tfName == "4H"
+
+        if lq.isBSL and lq.level > close   // BSL must be ABOVE price
+            if isDaily
+                if na(dBSLBest) or lq.level < dBSLBest
+                    dBSLBest := lq.level
+                    dBSLTime := lq.pivotTime
+            else if is4H
+                if na(hBSLBest) or lq.level < hBSLBest
+                    hBSLBest := lq.level
+                    hBSLTime := lq.pivotTime
+
+        if not lq.isBSL and lq.level < close   // SSL must be BELOW price
+            if isDaily
+                if na(dSSLBest) or lq.level > dSSLBest
+                    dSSLBest := lq.level
+                    dSSLTime := lq.pivotTime
+            else if is4H
+                if na(hSSLBest) or lq.level > hSSLBest
+                    hSSLBest := lq.level
+                    hSSLTime := lq.pivotTime
+
+    // ── Update visible 1D BSL ────────────────────────────────────────────────
+    if not na(dBSLBest)
+        if na(shownDailyBSL) or shownDailyBSL != dBSLTime
+            del_ll(dBSLLine, dBSLLabel)
+            [nl, nlb] = draw_ll(dBSLBest, "1D BSL", LIQ_D_COLOR)
+            dBSLLine  := nl
+            dBSLLabel := nlb
+            shownDailyBSL := dBSLTime
+        else
+            if not na(dBSLLine)
+                dBSLLine.set_y1(dBSLBest)
+                dBSLLine.set_y2(dBSLBest)
+            if not na(dBSLLabel)
+                dBSLLabel.set_y(dBSLBest)
+                dBSLLabel.set_x(bar_index)
+    else
+        del_ll(dBSLLine, dBSLLabel)
+        dBSLLine  := na
+        dBSLLabel := na
+        shownDailyBSL := na
+
+    // ── Update visible 1D SSL ────────────────────────────────────────────────
+    if not na(dSSLBest)
+        if na(shownDailySSL) or shownDailySSL != dSSLTime
+            del_ll(dSSLLine, dSSLLabel)
+            [nl, nlb] = draw_ll(dSSLBest, "1D SSL", LIQ_D_COLOR)
+            dSSLLine  := nl
+            dSSLLabel := nlb
+            shownDailySSL := dSSLTime
+        else
+            if not na(dSSLLine)
+                dSSLLine.set_y1(dSSLBest)
+                dSSLLine.set_y2(dSSLBest)
+            if not na(dSSLLabel)
+                dSSLLabel.set_y(dSSLBest)
+                dSSLLabel.set_x(bar_index)
+    else
+        del_ll(dSSLLine, dSSLLabel)
+        dSSLLine  := na
+        dSSLLabel := na
+        shownDailySSL := na
+
+    // ── Update visible 4H BSL ────────────────────────────────────────────────
+    if not na(hBSLBest)
+        if na(shown4hBSL) or shown4hBSL != hBSLTime
+            del_ll(hBSLLine, hBSLLabel)
+            [nl, nlb] = draw_ll(hBSLBest, "4H BSL", LIQ_4_COLOR)
+            hBSLLine  := nl
+            hBSLLabel := nlb
+            shown4hBSL := hBSLTime
+        else
+            if not na(hBSLLine)
+                hBSLLine.set_y1(hBSLBest)
+                hBSLLine.set_y2(hBSLBest)
+            if not na(hBSLLabel)
+                hBSLLabel.set_y(hBSLBest)
+                hBSLLabel.set_x(bar_index)
+    else
+        del_ll(hBSLLine, hBSLLabel)
+        hBSLLine  := na
+        hBSLLabel := na
+        shown4hBSL := na
+
+    // ── Update visible 4H SSL ────────────────────────────────────────────────
+    if not na(hSSLBest)
+        if na(shown4hSSL) or shown4hSSL != hSSLTime
+            del_ll(hSSLLine, hSSLLabel)
+            [nl, nlb] = draw_ll(hSSLBest, "4H SSL", LIQ_4_COLOR)
+            hSSLLine  := nl
+            hSSLLabel := nlb
+            shown4hSSL := hSSLTime
+        else
+            if not na(hSSLLine)
+                hSSLLine.set_y1(hSSLBest)
+                hSSLLine.set_y2(hSSLBest)
+            if not na(hSSLLabel)
+                hSSLLabel.set_y(hSSLBest)
+                hSSLLabel.set_x(bar_index)
+    else
+        del_ll(hSSLLine, hSSLLabel)
+        hSSLLine  := na
+        hSSLLabel := na
+        shown4hSSL := na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LIQUIDITY SWEEP DETECTION
+// BSL sweep: high wicks above level AND close is back below it
+// SSL sweep: low wicks below level AND close is back above it
+// ─────────────────────────────────────────────────────────────────────────────
+int liqSize = array.size(liqLevels)
+if liqSize > 0
+    for i = liqSize - 1 to 0
+        if i >= array.size(liqLevels)
+            continue
+        Liquidity lq = array.get(liqLevels, i)
+        if not lq.swept
+            bool bslSwept = lq.isBSL     and high > lq.level and close < lq.level
+            bool sslSwept = not lq.isBSL and low  < lq.level and close > lq.level
+            if sslSwept or bslSwept
+                lq.swept := true
+                // Clean up the visible line if this was the shown level
+                if not na(lq.id)
+                    lq.id.delete()
+                if not na(lq.lbl)
+                    lq.lbl.delete()
+                array.remove(liqLevels, i)
+
+// Prune excess tracked levels
+while array.size(liqLevels) > maxLiqLines * 2
+    Liquidity oldLiq = array.remove(liqLevels, 0)
+    if not na(oldLiq.id)
+        oldLiq.id.delete()
+    if not na(oldLiq.lbl)
+        oldLiq.lbl.delete()
+
+// Trim processed-time trackers
+while array.size(processedDailyTimes) > 200
+    array.remove(processedDailyTimes, 0)
+while array.size(processed4HTimes) > 200
+    array.remove(processed4HTimes, 0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DAILY BIAS LABEL  (ICT methodology)
+// ─────────────────────────────────────────────────────────────────────────────
+float yd_close = request.security(syminfo.tickerid, "1D", close[1], lookahead = barmerge.lookahead_on)
+float yd_high  = request.security(syminfo.tickerid, "1D", high[1],  lookahead = barmerge.lookahead_on)
+float yd_low   = request.security(syminfo.tickerid, "1D", low[1],   lookahead = barmerge.lookahead_on)
+float pd2_high = request.security(syminfo.tickerid, "1D", high[2],  lookahead = barmerge.lookahead_on)
+float pd2_low  = request.security(syminfo.tickerid, "1D", low[2],   lookahead = barmerge.lookahead_on)
+
+bool bullBias    = yd_close > pd2_high
+bool bearBias    = yd_close < pd2_low
+bool bullLiqGrab = yd_low  < pd2_low  and yd_close > pd2_low  and not bullBias and not bearBias
+bool bearLiqGrab = yd_high > pd2_high and yd_close < pd2_high and not bullBias and not bearBias
+
+string biasText = ""
+color  biasBg   = color.new(color.gray, 80)
+
+if bullBias
+    biasText := "▲ Bullish"
+    biasBg   := color.new(#089981, 80)
+else if bearBias
+    biasText := "▼ Bearish"
+    biasBg   := color.new(#f23645, 80)
+else if bullLiqGrab
+    biasText := "▲ Bullish  [SSL Grab]"
+    biasBg   := color.new(#089981, 88)
+else if bearLiqGrab
+    biasText := "▼ Bearish  [BSL Grab]"
+    biasBg   := color.new(#f23645, 88)
+else
+    biasText := "◆ Neutral / Ranging"
+    biasBg   := color.new(color.gray, 80)
+
+var label biasLabel = na
+if barstate.islast
+    if not na(biasLabel)
+        biasLabel.delete()
+    biasLabel := label.new(
+         x         = bar_index,
+         y         = high,
+         text      = "  Daily Bias\n  " + biasText + "  ",
+         xloc      = xloc.bar_index,
+         yloc      = yloc.abovebar,
+         color     = biasBg,
+         textcolor = color.white,
+         style     = label.style_label_lower_left,
+         size      = size.normal,
+         tooltip   = "ICT Bias: yesterday close vs day-before-yesterday range.\n" +
+                     "Prior High: "  + str.tostring(pd2_high, format.mintick) +
+                     "  Prior Low: " + str.tostring(pd2_low,  format.mintick) + "\n" +
+                     "Yd Close: "    + str.tostring(yd_close, format.mintick))
